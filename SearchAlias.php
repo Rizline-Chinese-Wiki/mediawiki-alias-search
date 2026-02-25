@@ -243,8 +243,9 @@ class RizSearchAlias {
     /**
      * 核心搜索方法 - 返回匹配结果（按优先级排序）
      * 优先级：原名匹配 > 别名匹配 > tag匹配
+     * @param array|null $namespaces 限制命名空间，null 表示不限制
      */
-    public static function searchMatches( string $term, int $limit = 10 ): array {
+    public static function searchMatches( string $term, int $limit = 10, ?array $namespaces = null ): array {
         $term = trim( $term );
         if ( mb_strlen( $term ) < 1 ) {
             return [];
@@ -265,6 +266,14 @@ class RizSearchAlias {
             array_keys( $aliasData )
         ) );
 
+        // 命名空间过滤
+        if ( $namespaces !== null && !empty( $namespaces ) ) {
+            $allPages = array_filter( $allPages, function( $page ) use ( $namespaces ) {
+                $titleObj = self::makeTitle( $page );
+                return $titleObj && in_array( $titleObj->getNamespace(), $namespaces );
+            });
+        }
+
         // 如果有tag过滤条件，先过滤
         if ( !empty( $requiredTags ) ) {
             $allPages = array_filter( $allPages, function( $page ) use ( $requiredTags, $tagData ) {
@@ -272,10 +281,11 @@ class RizSearchAlias {
             });
         }
 
-        // 三个优先级的结果数组
-        $titleMatches = [];  // 原名匹配
-        $aliasMatches = [];  // 别名匹配
-        $tagOnlyMatches = []; // 仅tag匹配（没有关键词时）
+        // 四个优先级的结果数组
+        $titleMatches = [];      // 原名匹配
+        $aliasMatches = [];      // 别名匹配
+        $tagKeywordMatches = []; // tag关键词匹配（用户直接搜tag内容）
+        $tagOnlyMatches = [];    // 仅tag过滤匹配（#tag#语法，没有关键词时）
 
         foreach ( $allPages as $pageName ) {
             $pageAliases = $aliasData[$pageName] ?? [];
@@ -321,10 +331,25 @@ class RizSearchAlias {
                     }
                 }
             }
+
+            // 3. Tag关键词匹配（最低优先级，直接搜tag内容）
+            if ( !$matched && !empty( $pageTags ) ) {
+                foreach ( $pageTags as $tag ) {
+                    if ( mb_strpos( mb_strtolower( $tag ), $keyword ) !== false ) {
+                        $tagKeywordMatches[] = [
+                            'title' => $pageName,
+                            'matchedAlias' => $tag,
+                            'source' => 'tag'
+                        ];
+                        $matched = true;
+                        break;
+                    }
+                }
+            }
         }
 
-        // 合并结果：原名匹配 > 别名匹配 > tag匹配
-        $results = array_merge( $titleMatches, $aliasMatches, $tagOnlyMatches );
+        // 合并结果：原名匹配 > 别名匹配 > tag关键词匹配 > tag过滤匹配
+        $results = array_merge( $titleMatches, $aliasMatches, $tagKeywordMatches, $tagOnlyMatches );
 
         // 去重（同一页面只保留最高优先级的匹配）
         $seen = [];
@@ -342,8 +367,8 @@ class RizSearchAlias {
     /**
      * 简单搜索 - 只返回标题列表
      */
-    public static function searchMatchTitles( string $term, int $limit = 10 ): array {
-        $matches = self::searchMatches( $term, $limit );
+    public static function searchMatchTitles( string $term, int $limit = 10, ?array $namespaces = null ): array {
+        $matches = self::searchMatches( $term, $limit, $namespaces );
         return array_map( function( $m ) { return $m['title']; }, $matches );
     }
 
@@ -357,10 +382,7 @@ class RizSearchAlias {
 
     public static function onPrefixSearch( $namespaces, $search, $limit, &$results ): bool {
         try {
-            if ( is_array( $namespaces ) && !empty( $namespaces ) && !in_array( NS_MAIN, $namespaces ) ) {
-                return true;
-            }
-            $matches = self::searchMatchTitles( $search, $limit );
+            $matches = self::searchMatchTitles( $search, $limit, is_array( $namespaces ) ? $namespaces : null );
             foreach ( $matches as $title ) {
                 if ( !in_array( $title, $results ) ) {
                     $results[] = $title;
@@ -458,10 +480,11 @@ class RizAliasSearchEngine extends \SearchEngine {
      */
     protected function completionSearchBackend( $search ) {
         $results = [];
+        $cleanSearch = self::stripNamespacePrefix( $search );
 
         // 1. 别名匹配 (Cargo + JSON)
         try {
-            $aliasMatches = RizSearchAlias::searchMatchTitles( $search, $this->limit );
+            $aliasMatches = RizSearchAlias::searchMatchTitles( $cleanSearch, $this->limit, $this->namespaces );
             foreach ( $aliasMatches as $titleText ) {
                 $titleObj = RizSearchAlias::makeTitle( $titleText );
                 if ( $titleObj && $titleObj->exists() ) {
@@ -473,18 +496,19 @@ class RizAliasSearchEngine extends \SearchEngine {
         // 2. 数据库标题搜索
         try {
             $db = $this->getDbConnection();
-            $searchLower = mb_strtolower( trim( $search ) );
+            $searchLower = mb_strtolower( trim( $cleanSearch ) );
 
             if ( mb_strlen( $searchLower ) >= 1 ) {
                 $like = $db->buildLike( $db->anyString(), $searchLower, $db->anyString() );
 
+                $nsCond = $this->namespaces ? [ 'page_namespace' => $this->namespaces ] : [ 'page_namespace' => NS_MAIN ];
+
                 $res = $db->select(
                     'page',
                     [ 'page_namespace', 'page_title' ],
-                    [
-                        'page_namespace' => NS_MAIN,
+                    array_merge( $nsCond, [
                         'LOWER(page_title) ' . $like
-                    ],
+                    ] ),
                     __METHOD__,
                     [ 'LIMIT' => $this->limit ]
                 );
@@ -507,6 +531,47 @@ class RizAliasSearchEngine extends \SearchEngine {
             }
         } catch ( \Throwable $e ) {}
 
+        // 3. 页面内容搜索 (searchindex LIKE)
+        try {
+            if ( count( $results ) < $this->limit ) {
+                $db = $this->getDbConnection();
+                $searchLower = mb_strtolower( trim( $cleanSearch ) );
+
+                if ( mb_strlen( $searchLower ) >= 2 ) {
+                    $like = $db->buildLike( $db->anyString(), $searchLower, $db->anyString() );
+
+                    $nsCond = $this->namespaces ? [ 'page_namespace' => $this->namespaces ] : [ 'page_namespace' => NS_MAIN ];
+
+                    $res = $db->select(
+                        [ 'searchindex', 'page' ],
+                        [ 'page_namespace', 'page_title' ],
+                        array_merge( $nsCond, [
+                            'LOWER(CONVERT(si_text USING utf8mb4)) ' . $like
+                        ] ),
+                        __METHOD__,
+                        [ 'LIMIT' => $this->limit - count( $results ) ],
+                        [ 'page' => [ 'JOIN', 'page_id = si_page' ] ]
+                    );
+
+                    $services = MediaWikiServices::getInstance();
+                    foreach ( $res as $row ) {
+                        if ( method_exists( $services, 'getTitleFactory' ) ) {
+                            $title = $services->getTitleFactory()->makeTitle( $row->page_namespace, $row->page_title );
+                        } else {
+                            $title = \Title::makeTitle( $row->page_namespace, $row->page_title );
+                        }
+
+                        if ( $title ) {
+                            $text = $title->getPrefixedText();
+                            if ( !in_array( $text, $results ) ) {
+                                $results[] = $text;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch ( \Throwable $e ) {}
+
         $results = array_slice( $results, 0, $this->limit );
         return \SearchSuggestionSet::fromStrings( $results );
     }
@@ -519,7 +584,7 @@ class RizAliasSearchEngine extends \SearchEngine {
 
         // 1. 别名匹配
         try {
-            $aliasMatches = RizSearchAlias::searchMatchTitles( $search, $this->limit );
+            $aliasMatches = RizSearchAlias::searchMatchTitles( $search, $this->limit, $this->namespaces );
             foreach ( $aliasMatches as $titleText ) {
                 $titleObj = RizSearchAlias::makeTitle( $titleText );
                 if ( $titleObj && $titleObj->exists() ) {
@@ -533,13 +598,14 @@ class RizAliasSearchEngine extends \SearchEngine {
             $db = $this->getDbConnection();
             $searchDb = str_replace( ' ', '_', $search );
 
+            $nsCond = $this->namespaces ? [ 'page_namespace' => $this->namespaces ] : [ 'page_namespace' => NS_MAIN ];
+
             $res = $db->select(
                 'page',
                 [ 'page_namespace', 'page_title' ],
-                [
-                    'page_namespace' => NS_MAIN,
+                array_merge( $nsCond, [
                     'page_title ' . $db->buildLike( $searchDb, $db->anyString() )
-                ],
+                ] ),
                 __METHOD__,
                 [ 'LIMIT' => $this->limit ]
             );
@@ -621,61 +687,40 @@ class RizAliasSearchEngine extends \SearchEngine {
     }
 
     /**
-     * 全文搜索 - 三路合并：别名匹配 + tag匹配 + 原生全文搜索
+     * 从搜索词中剥离命名空间前缀，返回纯关键词
      */
-    public function searchText( $term ) {
-        $services = MediaWikiServices::getInstance();
-        $results = [];
-
-        // 1. 别名和tag匹配
-        try {
-            $aliasMatches = RizSearchAlias::searchMatches( $term, $this->limit );
-            foreach ( $aliasMatches as $match ) {
-                $titleObj = RizSearchAlias::makeTitle( $match['title'] );
-                if ( $titleObj && $titleObj->exists() ) {
-                    $results[$match['title']] = [
-                        'title' => $titleObj,
-                        'source' => $match['source'],
-                        'matchedAlias' => $match['matchedAlias']
-                    ];
-                }
-            }
-        } catch ( \Throwable $e ) {}
-
-        // 2. 原生全文搜索
-        $fallbackEngine = $this->getFallbackEngine();
-        $nativeResults = null;
-
-        if ( $fallbackEngine ) {
-            try {
-                // 解析搜索词，只用关键词部分做全文搜索（去掉 #tag# 部分）
-                $parsed = RizSearchAlias::parseSearchTerm( $term );
-                $keyword = $parsed['keyword'];
-
-                if ( $keyword !== '' ) {
-                    $nativeResults = $fallbackEngine->searchText( $keyword );
-                }
-            } catch ( \Throwable $e ) {}
+    private static function stripNamespacePrefix( string $term ): string {
+        $titleObj = RizSearchAlias::makeTitle( $term );
+        if ( $titleObj && $titleObj->getNamespace() !== NS_MAIN ) {
+            return $titleObj->getText();
         }
-
-        // 3. 合并结果，创建自定义 SearchResultSet
-        return new RizSearchResultSet( $results, $nativeResults );
+        return $term;
     }
 
     /**
-     * 标题搜索 - 三路合并
+     * 全文搜索 - 别名/tag/标题/内容匹配，PHP 层分页
      */
-    public function searchTitle( $term ) {
-        $services = MediaWikiServices::getInstance();
-        $results = [];
+    public function searchText( $term ) {
+        $allResults = [];
+
+        // 解析命名空间前缀（如 "template:songinfo" → "songinfo" + 锁定 Template 命名空间）
+        $cleanTerm = $term;
+        $namespaces = $this->namespaces;
+        $titleObj = RizSearchAlias::makeTitle( $term );
+        if ( $titleObj && $titleObj->getNamespace() !== NS_MAIN ) {
+            $cleanTerm = $titleObj->getText();
+            $namespaces = [ $titleObj->getNamespace() ];
+        }
+        $parsed = RizSearchAlias::parseSearchTerm( $cleanTerm );
+        $keyword = $parsed['keyword'];
 
         // 1. 别名和tag匹配
         try {
-            $aliasMatches = RizSearchAlias::searchMatches( $term, $this->limit );
+            $aliasMatches = RizSearchAlias::searchMatches( $cleanTerm, 200, $namespaces );
             foreach ( $aliasMatches as $match ) {
                 $titleObj = RizSearchAlias::makeTitle( $match['title'] );
                 if ( $titleObj && $titleObj->exists() ) {
-                    $results[$match['title']] = [
+                    $allResults[$match['title']] = [
                         'title' => $titleObj,
                         'source' => $match['source'],
                         'matchedAlias' => $match['matchedAlias']
@@ -684,22 +729,118 @@ class RizAliasSearchEngine extends \SearchEngine {
             }
         } catch ( \Throwable $e ) {}
 
-        // 2. 原生标题搜索
-        $fallbackEngine = $this->getFallbackEngine();
-        $nativeResults = null;
+        // 2. 数据库标题搜索
+        try {
+            if ( $keyword !== '' && mb_strlen( $keyword ) >= 1 ) {
+                $db = $this->getDbConnection();
+                $like = $db->buildLike( $db->anyString(), mb_strtolower( $keyword ), $db->anyString() );
+                $nsCond = $namespaces ? [ 'page_namespace' => $namespaces ] : [];
 
-        if ( $fallbackEngine ) {
-            try {
-                $parsed = RizSearchAlias::parseSearchTerm( $term );
-                $keyword = $parsed['keyword'];
+                $res = $db->select(
+                    'page',
+                    [ 'page_namespace', 'page_title' ],
+                    array_merge( $nsCond, [ 'LOWER(page_title) ' . $like ] ),
+                    __METHOD__,
+                    [ 'LIMIT' => 500 ]
+                );
 
-                if ( $keyword !== '' ) {
-                    $nativeResults = $fallbackEngine->searchTitle( $keyword );
+                $services = MediaWikiServices::getInstance();
+                foreach ( $res as $row ) {
+                    if ( method_exists( $services, 'getTitleFactory' ) ) {
+                        $title = $services->getTitleFactory()->makeTitle( $row->page_namespace, $row->page_title );
+                    } else {
+                        $title = \Title::makeTitle( $row->page_namespace, $row->page_title );
+                    }
+                    if ( $title ) {
+                        $titleText = $title->getPrefixedText();
+                        if ( !isset( $allResults[$titleText] ) ) {
+                            $allResults[$titleText] = [
+                                'title' => $title,
+                                'source' => 'title',
+                                'matchedAlias' => $titleText
+                            ];
+                        }
+                    }
                 }
-            } catch ( \Throwable $e ) {}
-        }
+            }
+        } catch ( \Throwable $e ) {}
 
-        return new RizSearchResultSet( $results, $nativeResults );
+        // 3. searchindex 内容搜索
+        try {
+            if ( $keyword !== '' && mb_strlen( $keyword ) >= 2 ) {
+                $db = $this->getDbConnection();
+                $like = $db->buildLike( $db->anyString(), mb_strtolower( $keyword ), $db->anyString() );
+                $nsCond = $namespaces ? [ 'page_namespace' => $namespaces ] : [];
+
+                $res = $db->select(
+                    [ 'searchindex', 'page' ],
+                    [ 'page_namespace', 'page_title' ],
+                    array_merge( $nsCond, [
+                        'LOWER(CONVERT(si_text USING utf8mb4)) ' . $like
+                    ] ),
+                    __METHOD__,
+                    [ 'LIMIT' => 500 ],
+                    [ 'page' => [ 'JOIN', 'page_id = si_page' ] ]
+                );
+
+                $services = MediaWikiServices::getInstance();
+                foreach ( $res as $row ) {
+                    if ( method_exists( $services, 'getTitleFactory' ) ) {
+                        $title = $services->getTitleFactory()->makeTitle( $row->page_namespace, $row->page_title );
+                    } else {
+                        $title = \Title::makeTitle( $row->page_namespace, $row->page_title );
+                    }
+                    if ( $title ) {
+                        $titleText = $title->getPrefixedText();
+                        if ( !isset( $allResults[$titleText] ) ) {
+                            $allResults[$titleText] = [
+                                'title' => $title,
+                                'source' => 'content',
+                                'matchedAlias' => $keyword
+                            ];
+                        }
+                    }
+                }
+            }
+        } catch ( \Throwable $e ) {}
+
+        // PHP 层分页：按 offset 和 limit 切片
+        $total = count( $allResults );
+        $paged = array_slice( $allResults, $this->offset, $this->limit, true );
+        $hasMore = ( $this->offset + $this->limit ) < $total;
+
+        return new RizSearchResultSet( $paged, null, $hasMore );
+    }
+
+    /**
+     * 写入搜索索引 - 委托给原生 MySQL 引擎
+     */
+    public function update( $id, $title, $text ) {
+        $engine = $this->getFallbackEngine();
+        if ( $engine ) {
+            $engine->update( $id, $title, $text );
+        }
+    }
+
+    public function updateTitle( $id, $title ) {
+        $engine = $this->getFallbackEngine();
+        if ( $engine ) {
+            $engine->updateTitle( $id, $title );
+        }
+    }
+
+    public function delete( $id, $title ) {
+        $engine = $this->getFallbackEngine();
+        if ( $engine ) {
+            $engine->delete( $id, $title );
+        }
+    }
+
+    /**
+     * 标题搜索 - 统一由 searchText 处理，避免重复
+     */
+    public function searchTitle( $term ) {
+        return new RizSearchResultSet( [] );
     }
 }
 
@@ -711,10 +852,12 @@ class RizSearchResultSet extends \SearchResultSet {
     private $nativeResults;
     private $allResults = [];
     private $position = 0;
+    private $hasMore = false;
 
-    public function __construct( array $aliasResults, $nativeResults = null ) {
+    public function __construct( array $aliasResults, $nativeResults = null, bool $hasMore = false ) {
         $this->aliasResults = $aliasResults;
         $this->nativeResults = $nativeResults;
+        $this->hasMore = $hasMore;
 
         // 先添加别名匹配结果
         foreach ( $aliasResults as $key => $data ) {
@@ -741,8 +884,16 @@ class RizSearchResultSet extends \SearchResultSet {
         return count( $this->allResults );
     }
 
+    public function getTotalHits() {
+        if ( $this->hasMore ) {
+            // 返回一个大于 offset+limit 的数，让 MediaWiki 显示翻页
+            return $this->numRows() + 1000;
+        }
+        return $this->numRows();
+    }
+
     public function hasMoreResults() {
-        return false;
+        return $this->hasMore;
     }
 
     public function next() {
@@ -783,11 +934,36 @@ class RizSearchResult extends \SearchResult {
     protected $mTitle;
     protected $source;
     protected $matchedAlias;
+    protected $byteSize = 0;
+    protected $wordCount = 0;
+    protected $timestamp = '';
 
     public function __construct( $title, $source = 'title', $matchedAlias = '' ) {
         $this->mTitle = $title;
         $this->source = $source;
         $this->matchedAlias = $matchedAlias;
+
+        // 从页面读取实际数据
+        if ( $title && $title->exists() ) {
+            try {
+                $services = MediaWikiServices::getInstance();
+                if ( method_exists( $services, 'getWikiPageFactory' ) ) {
+                    $wikiPage = $services->getWikiPageFactory()->newFromTitle( $title );
+                } else {
+                    $wikiPage = \WikiPage::factory( $title );
+                }
+                $content = $wikiPage->getContent();
+                if ( $content ) {
+                    $text = $content->serialize();
+                    $this->byteSize = strlen( $text );
+                    $this->wordCount = mb_strlen( strip_tags( $text ) );
+                }
+                $rev = $wikiPage->getRevisionRecord();
+                if ( $rev ) {
+                    $this->timestamp = $rev->getTimestamp();
+                }
+            } catch ( \Throwable $e ) {}
+        }
     }
 
     public function getTitle() {
@@ -798,11 +974,25 @@ class RizSearchResult extends \SearchResult {
         return false;
     }
 
+    public function getByteSize() {
+        return $this->byteSize;
+    }
+
+    public function getWordCount() {
+        return $this->wordCount;
+    }
+
+    public function getTimestamp() {
+        return $this->timestamp;
+    }
+
     public function getTextSnippet( $terms = [] ) {
         if ( $this->source === 'alias' && $this->matchedAlias ) {
             return '别名匹配: ' . htmlspecialchars( $this->matchedAlias );
         } elseif ( $this->source === 'tag' ) {
             return 'Tag匹配: ' . htmlspecialchars( $this->matchedAlias );
+        } elseif ( $this->source === 'content' ) {
+            return '内容匹配: ' . htmlspecialchars( $this->matchedAlias );
         }
         return '';
     }
